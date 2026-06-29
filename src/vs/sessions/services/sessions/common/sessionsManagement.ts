@@ -340,8 +340,9 @@ export interface ISessionsManagementService {
 	 * The started session appears in the sessions list once the provider
 	 * commits it, while the user's current view is left untouched. Intended for
 	 * callers outside the new-session composer that want to kick off a session
-	 * programmatically. Rejects (after disposing the stranded draft) if the send
-	 * fails.
+	 * programmatically. Returns the committed session, or `undefined` if the
+	 * service was disposed during the send. Rejects (after disposing the
+	 * stranded draft) if the send fails.
 	 */
 	createAndSendNewChatRequest(folderUri: URI, options: ISendRequestOptions, createOptions?: ICreateNewSessionOptions): Promise<ISession | undefined>;
 

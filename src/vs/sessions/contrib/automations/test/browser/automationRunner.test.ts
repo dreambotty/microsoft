@@ -208,6 +208,8 @@ suite('AutomationRunner', () => {
 			modelId: undefined,
 			modeId: undefined,
 			permissionLevel: undefined,
+			isolationMode: undefined,
+			branch: undefined,
 		});
 	});
 
@@ -232,6 +234,8 @@ suite('AutomationRunner', () => {
 			modelId: undefined,
 			modeId: 'agent',
 			permissionLevel: 'autopilot',
+			isolationMode: undefined,
+			branch: undefined,
 		});
 	});
 

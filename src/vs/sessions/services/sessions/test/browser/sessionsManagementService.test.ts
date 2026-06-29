@@ -27,7 +27,7 @@ import { IChat, ISession, ISessionType, ISessionWorkspace, SessionStatus } from 
 import { ILanguageModelChatMetadataAndIdentifier } from '../../../../../workbench/contrib/chat/common/languageModels.js';
 import { ISessionChangeEvent, ISendRequestOptions, ISessionModelPickerOptions, ISessionsProvider } from '../../common/sessionsProvider.js';
 import { SessionsManagementService } from '../../browser/sessionsManagementService.js';
-import { ISessionsManagementService } from '../../common/sessionsManagement.js';
+import { ISessionsManagementService, ICreateNewSessionOptions } from '../../common/sessionsManagement.js';
 import { SessionsService } from '../../browser/sessionsService.js';
 import { ISessionsPartService } from '../../browser/sessionsPartService.js';
 import { ISessionsProvidersService } from '../../browser/sessionsProvidersService.js';
@@ -826,6 +826,68 @@ suite('SessionsManagementService', () => {
 		// The request was sent, but the user's view was not navigated into the session.
 		assert.strictEqual(sendRequestStarted, true);
 		assert.strictEqual(view.activeSession.get(), undefined);
+	});
+
+	test('createAndSendNewChatRequest invokes configuration setters from createOptions', async () => {
+		const chat: IChat = { ...stubChat, resource: URI.parse('test:///chat') };
+		const session = stubSession({
+			sessionId: 's1',
+			providerId: 'test',
+			chats: constObservable([chat]),
+			mainChat: constObservable(chat),
+		});
+		const calls: string[] = [];
+		const provider = new class extends TestSessionsProvider {
+			override resolveWorkspace(): ISessionWorkspace { return { folderUri: URI.parse('test:///folder') } as unknown as ISessionWorkspace; }
+			override setModel(): void { calls.push(`setModel:${arguments[1]}`); }
+			override setMode(_sessionId: string, _modeId: string): void { calls.push(`setMode:${_modeId}`); }
+			override setPermissionLevel(_sessionId: string, _level: string): void { calls.push(`setPermissionLevel:${_level}`); }
+			override setIsolationMode(_sessionId: string, _mode: string): void { calls.push(`setIsolationMode:${_mode}`); }
+			override setBranch(_sessionId: string, _branch: string): void { calls.push(`setBranch:${_branch}`); }
+			override async sendRequest(_sessionId: string, _chatResource: URI, _options: ISendRequestOptions): Promise<ISession> { return session; }
+		}(session);
+		const { service } = createSessionsManagementService(session, disposables, provider);
+
+		const createOptions: ICreateNewSessionOptions = {
+			modelId: 'gpt-4o',
+			modeId: 'agent',
+			permissionLevel: 'allowedTools',
+			isolationMode: 'worktree',
+			branch: 'main',
+		};
+		await service.createAndSendNewChatRequest(URI.parse('test:///folder'), { query: 'hi' }, createOptions);
+
+		assert.deepStrictEqual(calls, [
+			'setModel:gpt-4o',
+			'setMode:agent',
+			'setPermissionLevel:allowedTools',
+			'setIsolationMode:worktree',
+			'setBranch:main',
+		]);
+	});
+
+	test('createAndSendNewChatRequest disposes stranded draft when a setter throws', async () => {
+		const chat: IChat = { ...stubChat, resource: URI.parse('test:///chat') };
+		const session = stubSession({
+			sessionId: 's1',
+			providerId: 'test',
+			chats: constObservable([chat]),
+			mainChat: constObservable(chat),
+		});
+		let deleted = false;
+		const provider = new class extends TestSessionsProvider {
+			override resolveWorkspace(): ISessionWorkspace { return { folderUri: URI.parse('test:///folder') } as unknown as ISessionWorkspace; }
+			override setModel(): void { throw new Error('model not found'); }
+			override deleteNewSession(): void { deleted = true; }
+			override async sendRequest(_sessionId: string, _chatResource: URI, _options: ISendRequestOptions): Promise<ISession> { return session; }
+		}(session);
+		const { service } = createSessionsManagementService(session, disposables, provider);
+
+		await assert.rejects(
+			() => service.createAndSendNewChatRequest(URI.parse('test:///folder'), { query: 'hi' }, { modelId: 'bad' }),
+			/model not found/,
+		);
+		assert.strictEqual(deleted, true);
 	});
 
 	test('discardNewSession fires onDidDiscardNewSession with the discarded draft', () => {
