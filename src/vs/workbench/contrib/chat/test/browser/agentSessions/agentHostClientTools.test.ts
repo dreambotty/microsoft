@@ -11,6 +11,7 @@ import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { DisposableStore, IReference, toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { constObservable, observableValue } from '../../../../../../base/common/observable.js';
+import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { mock } from '../../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
 import { ILogService, NullLogService } from '../../../../../../platform/log/common/log.js';
@@ -43,7 +44,7 @@ import { IAgentSubscription } from '../../../../../../platform/agentHost/common/
 import { ITerminalChatService } from '../../../../terminal/browser/terminal.js';
 import { IAgentHostTerminalService } from '../../../../terminal/browser/agentHostTerminalService.js';
 import { IAgentHostSessionWorkingDirectoryResolver } from '../../../browser/agentSessions/agentHost/agentHostSessionWorkingDirectoryResolver.js';
-import { ILanguageModelToolsService, IToolData, IToolInvocation, IToolResult, ToolAndToolSetEnablementMap, ToolDataSource } from '../../../common/tools/languageModelToolsService.js';
+import { ILanguageModelToolsService, IToolData, IToolInvocation, IToolResult, IToolSet, ToolAndToolSetEnablementMap, ToolDataSource } from '../../../common/tools/languageModelToolsService.js';
 import { IChatSessionsService } from '../../../common/chatSessionsService.js';
 import { ICustomizationHarnessService } from '../../../common/customizationHarnessService.js';
 import { IAgentPluginService } from '../../../common/plugins/agentPluginService.js';
@@ -52,6 +53,7 @@ import { IDefaultAccountService } from '../../../../../../platform/defaultAccoun
 import { IAuthenticationService } from '../../../../../services/authentication/common/authentication.js';
 import { ChatEntitlement, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
 import { IPromptsService } from '../../../common/promptSyntax/service/promptsService.js';
+import { IAICustomizationWorkspaceService } from '../../../common/aiCustomizationWorkspaceService.js';
 
 // =============================================================================
 // Unit tests for toolDataToDefinition and toolResultToProtocol
@@ -241,7 +243,7 @@ suite('AgentHostClientTools', () => {
 
 	suite('client tools registration', () => {
 
-		function createMockToolsService(disposables: DisposableStore, tools: IToolData[], options?: { requireConfirmation?: boolean }) {
+		function createMockToolsService(disposables: DisposableStore, tools: IToolData[], options?: { requireConfirmation?: boolean; toolSets?: IToolSet[] }) {
 			const onDidChangeTools = disposables.add(new Emitter<void>());
 			const pendingToolCalls = new Map<string, ChatToolInvocation>();
 			const begunToolCalls: ChatToolInvocation[] = [];
@@ -293,7 +295,7 @@ suite('AgentHostClientTools', () => {
 				updateToolStream: async () => { },
 				cancelToolCallsForRequest: () => { },
 				flushToolUpdates: () => { },
-				toolSets: observableValue('sets', []),
+				toolSets: observableValue('sets', options?.toolSets ?? []),
 				getToolSetsForModel: () => [],
 				getToolSet: () => undefined,
 				getToolSetByName: () => undefined,
@@ -317,6 +319,22 @@ suite('AgentHostClientTools', () => {
 				begunToolCalls,
 				invokedToolCalls,
 			} satisfies ILanguageModelToolsService & { fireOnDidChangeTools: () => void; begunToolCalls: ChatToolInvocation[]; invokedToolCalls: IToolInvocation[] };
+		}
+
+		function createTestToolSet(id: string, tools: readonly IToolData[]): IToolSet {
+			return {
+				id,
+				referenceName: id,
+				icon: ThemeIcon.fromId('tools'),
+				source: ToolDataSource.Internal,
+				getTools: () => tools,
+			};
+		}
+
+		function createCustomizationWorkspaceService(isSessionsWindow: boolean): IAICustomizationWorkspaceService {
+			return new class extends mock<IAICustomizationWorkspaceService>() {
+				override readonly isSessionsWindow = isSessionsWindow;
+			};
 		}
 
 		class MockAgentHostConnection extends mock<IAgentHostService>() {
@@ -418,7 +436,7 @@ suite('AgentHostClientTools', () => {
 		function createHandlerWithMocks(
 			disposables: DisposableStore,
 			tools: IToolData[],
-			toolServiceOptions?: { requireConfirmation?: boolean },
+			toolServiceOptions?: { requireConfirmation?: boolean; toolSets?: IToolSet[]; isSessionsWindow?: boolean },
 		) {
 			const instantiationService = disposables.add(new TestInstantiationService());
 			const connection = new MockAgentHostConnection();
@@ -503,6 +521,7 @@ suite('AgentHostClientTools', () => {
 				isNewSession: () => false,
 			});
 			instantiationService.stub(ILanguageModelToolsService, toolsService);
+			instantiationService.stub(IAICustomizationWorkspaceService, createCustomizationWorkspaceService(toolServiceOptions?.isSessionsWindow ?? false));
 			instantiationService.stub(IAgentHostToolSetEnablementService, {
 				observe: () => constObservable<IToolEnablementState>({ toolSets: new Map(), tools: new Map() }),
 				getState: () => ({ toolSets: new Map(), tools: new Map() }),
@@ -525,7 +544,7 @@ suite('AgentHostClientTools', () => {
 				connectionAuthority: 'local',
 			}));
 
-			return { handler, connection, toolsService, configValues, onDidChangeConfig };
+			return { handler, connection, toolsService, activeClientService, configValues, onDidChangeConfig };
 		}
 
 		const testRunTestsTool: IToolData = {
@@ -554,6 +573,14 @@ suite('AgentHostClientTools', () => {
 			source: ToolDataSource.Internal,
 		};
 
+		const testProblemsTool: IToolData = {
+			id: 'copilot_getErrors',
+			toolReferenceName: 'problems',
+			displayName: 'Get Problems',
+			modelDescription: 'Gets workspace problems',
+			source: ToolDataSource.Internal,
+		};
+
 		test('maps tool data to protocol definitions', async () => {
 			const { connection } = createHandlerWithMocks(disposables, [testRunTestsTool, testRunTaskTool, testUnlistedTool]);
 
@@ -578,6 +605,29 @@ suite('AgentHostClientTools', () => {
 			// before reaching getClientTools.
 			const def = toolDataToDefinition(testRunTestsTool);
 			assert.strictEqual(def.name, 'runTests');
+		});
+
+		test('does not advertise the problems tool to agent host in a sessions window', () => {
+			const getAdvertisedToolNames = (isSessionsWindow: boolean) => {
+				const tools = [testRunTaskTool, testProblemsTool];
+				const { activeClientService } = createHandlerWithMocks(disposables, tools, {
+					toolSets: [createTestToolSet('vscode-general', tools)],
+					isSessionsWindow,
+				});
+
+				return activeClientService
+					.getClientTools('agent-host-copilotcli')
+					.get()
+					.map(tool => tool.name);
+			};
+
+			assert.deepStrictEqual({
+				workbench: getAdvertisedToolNames(false),
+				sessionsWindow: getAdvertisedToolNames(true),
+			}, {
+				workbench: ['runTask', 'problems'],
+				sessionsWindow: ['runTask'],
+			});
 		});
 
 		test('invokes an owned client tool when reconnecting to an active turn', async () => {
