@@ -10,8 +10,9 @@ import { mkdir, readFile, unlink } from 'fs/promises';
 import { release, tmpdir } from 'os';
 import { Delayer, ProcessTimeRunOnceScheduler, timeout } from '../../../base/common/async.js';
 import { VSBuffer } from '../../../base/common/buffer.js';
-import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
+import { CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { memoize } from '../../../base/common/decorators.js';
+import { isCancellationError } from '../../../base/common/errors.js';
 import { hash } from '../../../base/common/hash.js';
 import * as path from '../../../base/common/path.js';
 import { basename } from '../../../base/common/path.js';
@@ -59,6 +60,10 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 
 	private availableUpdate: IAvailableUpdate | undefined;
 	private updateCancellationTokenSource: CancellationTokenSource | undefined;
+	/** Cancels an in-flight check/download chain (e.g. when updates are disabled at runtime). */
+	private checkCancellationTokenSource: CancellationTokenSource | undefined;
+	/** Settles when the in-flight check/download chain has fully unwound; used by the cancel path. */
+	private checkPromise: Promise<unknown> | undefined;
 
 	private readonly readyMutexName: string;
 	private readonly updatingMutexName: string;
@@ -213,11 +218,20 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 			this.setState(State.CheckingForUpdates(explicit));
 		}
 
+		// Track this check/download chain so it can be cancelled if updates are disabled at runtime.
+		this.checkCancellationTokenSource?.dispose(true);
+		const cts = this.checkCancellationTokenSource = new CancellationTokenSource();
+		const token = cts.token;
+
 		const headers = getUpdateRequestHeaders(this.productService.version);
-		this.requestService.request({ url, headers, callSite: 'updateService.win32.checkForUpdates' }, CancellationToken.None)
+		const promise = this.requestService.request({ url, headers, callSite: 'updateService.win32.checkForUpdates' }, token)
 			.then<IUpdate | null>(asJson)
 			.then(update => {
 				const updateType = getUpdateType();
+
+				if (token.isCancellationRequested) {
+					return Promise.resolve(null);
+				}
 
 				if (!update || !update.url || !update.version || !update.productVersion) {
 					// If we were checking for an overwrite update and found nothing newer,
@@ -256,7 +270,7 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 
 							const downloadPath = `${updatePackagePath}.tmp`;
 
-							return this.requestService.request({ url: update.url, callSite: 'updateService.win32.downloadUpdate' }, CancellationToken.None)
+							return this.requestService.request({ url: update.url, callSite: 'updateService.win32.downloadUpdate' }, token)
 								.then(context => {
 									// Get total size from Content-Length header
 									const contentLengthHeader = context.res.headers['content-length'];
@@ -288,6 +302,10 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 								.then(() => updatePackagePath);
 						});
 					}).then(packagePath => {
+						if (token.isCancellationRequested) {
+							return;
+						}
+
 						this.availableUpdate = { packagePath };
 						this.saveUpdateMetadata(update);
 						this.setState(State.Downloaded(update, explicit, this._overwrite));
@@ -302,6 +320,11 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 				});
 			})
 			.then(undefined, err => {
+				// The chain was cancelled because updates are being disabled; leave state to the disable flow.
+				if (token.isCancellationRequested || isCancellationError(err)) {
+					return;
+				}
+
 				this.telemetryService.publicLog2<{ messageHash: string }, UpdateErrorClassification>('update:error', { messageHash: String(hash(String(err))) });
 				this.logService.error(err);
 
@@ -317,6 +340,18 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 					this.setState(State.Idle(getUpdateType(), message));
 				}
 			});
+
+		this.checkPromise = promise;
+
+		promise.finally(() => {
+			if (this.checkCancellationTokenSource === cts) {
+				this.checkCancellationTokenSource = undefined;
+			}
+			if (this.checkPromise === promise) {
+				this.checkPromise = undefined;
+			}
+			cts.dispose();
+		});
 	}
 
 	protected override async doDownloadUpdate(state: AvailableForDownload): Promise<void> {
@@ -460,6 +495,36 @@ export class Win32UpdateService extends AbstractUpdateService implements IRelaun
 			}
 			cts.dispose();
 		});
+	}
+
+	protected override async cancelUpdate(): Promise<void> {
+		// Abort an in-flight check/download so it never reaches the background installer.
+		const hadInFlightCheck = !!this.checkCancellationTokenSource;
+		this.checkCancellationTokenSource?.dispose(true);
+		this.checkCancellationTokenSource = undefined;
+
+		// Only clean up if a check/download was in flight; avoids creating the cache dir when just disabled.
+		if (hadInFlightCheck) {
+			try {
+				await this.checkPromise;
+			} catch {
+				// the chain swallows its own errors; ignore
+			}
+			await this.cleanupTempFiles();
+		}
+
+		// Tear down any pending (downloaded/applying) update.
+		await this.cancelPendingUpdate();
+	}
+
+	private async cleanupTempFiles(): Promise<void> {
+		try {
+			const cachePath = await this.cachePath;
+			const files = await pfs.Promises.readdir(cachePath);
+			await Promise.all(files.filter(file => file.endsWith('.tmp')).map(file => this.unlink(path.join(cachePath, file))));
+		} catch (err) {
+			this.logService.warn('update#cleanupTempFiles: failed to remove temporary download files', err);
+		}
 	}
 
 	protected override async cancelPendingUpdate(): Promise<void> {

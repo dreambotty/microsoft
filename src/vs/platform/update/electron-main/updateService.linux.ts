@@ -14,7 +14,7 @@ import { IProductService } from '../../product/common/productService.js';
 import { asJson, IRequestService } from '../../request/common/request.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
-import { AvailableForDownload, IUpdate, State, UpdateType } from '../common/update.js';
+import { AvailableForDownload, IUpdate, State, StateType, UpdateType } from '../common/update.js';
 import { AbstractUpdateService, createUpdateURL, IUpdateURLOptions } from './abstractUpdateService.js';
 
 export class LinuxUpdateService extends AbstractUpdateService {
@@ -51,6 +51,12 @@ export class LinuxUpdateService extends AbstractUpdateService {
 		this.requestService.request({ url, callSite: 'updateService.linux.checkForUpdates' }, CancellationToken.None)
 			.then<IUpdate | null>(asJson)
 			.then(update => {
+				// If updates were disabled while this check was in flight, ignore the result so we don't
+				// transition back to Idle/AvailableForDownload from the Disabled state.
+				if (this.state.type !== StateType.CheckingForUpdates) {
+					return;
+				}
+
 				if (!update || !update.url || !update.version || !update.productVersion) {
 					this.setState(State.Idle(UpdateType.Archive, undefined, explicit || undefined));
 				} else {
@@ -58,6 +64,10 @@ export class LinuxUpdateService extends AbstractUpdateService {
 				}
 			})
 			.then(undefined, err => {
+				if (this.state.type !== StateType.CheckingForUpdates) {
+					return;
+				}
+
 				this.logService.error(err);
 				// only show message when explicitly checking for updates
 				const message: string | undefined = explicit ? (err.message || err) : undefined;
