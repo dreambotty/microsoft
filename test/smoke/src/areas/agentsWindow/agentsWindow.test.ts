@@ -905,7 +905,7 @@ export function setup(logger: Logger) {
 			},
 		});
 
-		it.skip('Test Codex session', async function () {
+		it('Test Codex session', async function () {
 			this.timeout(5 * 60 * 1000);
 
 			const app = this.app as Application;
@@ -941,6 +941,30 @@ export function setup(logger: Logger) {
 				}
 				logger.log('[Agents Window/Codex] Codex session type not available in this built product (no product.agentSdks.codex); skipping');
 				this.skip();
+			}
+
+			// Even when Codex reports as "available" (the tiny `@openai/codex`
+			// launcher shim resolved), the native binary lives in a separate
+			// per-platform *optional* dependency (`@openai/codex-<platform>-<arch>`).
+			// npm silently skips optional deps whose install fails, so a stale or
+			// poisoned Linux `node_modules` cache can lack the binary while the shim
+			// is present — the session then fails at spawn time with a cryptic
+			// "Codex binary not executable" and this test only times out. When
+			// running from source, fail fast with an actionable message instead.
+			if (process.env['VSCODE_DEV'] === '1') {
+				const repoRoot = path.resolve(process.cwd(), '..', '..');
+				const platformPkgDir = path.join(repoRoot, 'node_modules', `@openai/codex-${process.platform}-${process.arch}`);
+				const binaryName = process.platform === 'win32' ? 'codex.exe' : 'codex';
+				let codexBinaryFound = false;
+				try {
+					const vendorDir = path.join(platformPkgDir, 'vendor');
+					codexBinaryFound = fs.readdirSync(vendorDir).some(triple => fs.existsSync(path.join(vendorDir, triple, 'bin', binaryName)));
+				} catch {
+					// vendor dir (or the whole platform package) is missing → treated as not found
+				}
+				if (!codexBinaryFound) {
+					throw new Error(`[Agents Window/Codex] Codex native binary missing under ${platformPkgDir}. It ships as an optional dependency of @openai/codex, which npm silently skips when its install fails, so a stale Linux node_modules cache can lack it while the @openai/codex launcher shim (which makes Codex report as "available") is present. Fix: bump build/.cachesalt to force a fresh npm ci. See https://github.com/microsoft/vscode/pull/323881`);
+				}
 			}
 
 			try {
