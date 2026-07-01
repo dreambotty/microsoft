@@ -9,6 +9,7 @@ import { AgentSession } from '../common/agentService.js';
 import type { MessageAttachment } from '../common/state/protocol/state.js';
 import { isAhpChatChannel, isSubagentSession, parseRequiredSessionUriFromChatUri, type ISessionWithDefaultChat } from '../common/state/sessionState.js';
 import type { ToolInvokedResult } from './agentHostToolCallTracker.js';
+import type { IAgentHostRestrictedTelemetry } from './agentHostRestrictedTelemetry.js';
 
 export type AgentHostUserMessageSentSource = 'direct' | 'queued';
 
@@ -85,6 +86,12 @@ export class AgentHostTelemetryReporter {
 
 	constructor(private readonly _telemetryService: ITelemetryService) { }
 
+	/** The restricted GH/MSFT telemetry surface, present when the agent-host telemetry service is wired. */
+	private get _restricted(): IAgentHostRestrictedTelemetry | undefined {
+		const ts = this._telemetryService as Partial<IAgentHostRestrictedTelemetry>;
+		return typeof ts.sendEnhancedGHTelemetryEvent === 'function' ? ts as IAgentHostRestrictedTelemetry : undefined;
+	}
+
 	userMessageSent(provider: string, session: string, sessionState: ISessionWithDefaultChat | undefined, source: AgentHostUserMessageSentSource, attachments: readonly MessageAttachment[] | undefined): void {
 		const attachmentCount = attachments?.length ?? 0;
 		const activeClients = sessionState?.activeClients ?? [];
@@ -102,6 +109,20 @@ export class AgentHostTelemetryReporter {
 			} : {}),
 			attachmentCount,
 		});
+
+		// Mirror the Copilot extension's enhanced GH `request.options.tools` event so the set of
+		// tools offered to the model on this turn is captured for the agent-host flow too.
+		const restricted = this._restricted;
+		if (restricted && activeClients.length > 0) {
+			const toolNames = activeClients.flatMap(client => client.tools.map(tool => tool.name));
+			restricted.sendEnhancedGHTelemetryEvent('request.options.tools', {
+				conversation_id: AgentSession.id(sessionUri),
+				tool_counts: String(toolNames.length),
+				tools: JSON.stringify(toolNames).slice(0, 8000),
+			}, {
+				toolCount: toolNames.length,
+			});
+		}
 	}
 
 	turnCompleted(report: IAgentHostTurnCompletedReport): void {
